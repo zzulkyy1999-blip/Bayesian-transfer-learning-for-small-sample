@@ -1,0 +1,181 @@
+import numpy as np
+from scipy.stats import norm
+import mpmath as mh
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+mh.mp.dps = 10
+mh.mp.pretty = True
+np.random.seed(1)  
+a, b_t, b_s = 10, 1, 1
+u_t, v_t, u_s, v_s = 0, 10, 0, 10
+mu_t, gamma_t, n_t = 0.0, 10.0, 10        
+gamma_s_fixed = 10.0                      
+sigma2_true = 1.0 / gamma_t              
+def hypar_update(n, D, a, b, b_ts, u, v):
+    v_new = v + n
+    a_new = a + n / 2
+    x_bar = np.mean(D)
+    u_new = (v * u + n * x_bar) / (v + n)
+    S = np.var(D)
+    b_new = 1 / (b / b_ts + n * S / 2 + n * v * (x_bar - u)**2 / (2 * (n + v)))
+    return v_new, u_new, a_new, b_new
+
+def post_pred_var(a, c, a_t_new, b_t_new, v_t_new, a_s_new, b_s_new):
+    z = c * b_t_new * b_s_new
+    try:
+        num = mh.hyp2f1(a_t_new - 1, a_s_new, a, z, asymp_tol=1e-4)
+        den = mh.hyp2f1(a_t_new,     a_s_new, a, z, asymp_tol=1e-4)
+        ratio = num / den
+    except Exception:
+        ratio = 1.0
+    var = (1 + v_t_new) / (v_t_new * b_t_new * (a_t_new - 1)) * ratio
+    return float(mh.re(var))
+def kl_normal(mu1, sigma1, mu2, sigma2):
+    return np.log(sigma2/sigma1) + (sigma1**2 + (mu1 - mu2)**2)/(2*sigma2**2) - 0.5
+
+def generate_posteriors_one_rep_fixed_rho(K, rho_level, gamma_s=gamma_s_fixed):
+    n_s_vec = np.random.randint(10, 1000, size=K)
+    rho_vec = np.full(K, rho_level)
+
+    D_t = norm.rvs(loc=mu_t, scale=1/np.sqrt(gamma_t), size=n_t)
+    rho_eff = rho_level
+    b_ts_t = (1 - rho_eff) * b_t * b_s
+    v_t_new, u_t_new, a_t_new, b_t_new = hypar_update(n_t, D_t, a, b_s, b_ts_t, u_t, v_t)
+
+    a_s_all, b_s_all, c_all, kl_list = [], [], [], []
+    for k in range(K):
+        n_s_k = n_s_vec[k]
+        rho_k = rho_vec[k]
+        b_ts_k = (1 - rho_k) * b_t * b_s
+        c_k = (b_t * b_s - b_ts_k) / (b_ts_k**2)
+
+        D_s_k = norm.rvs(loc=0.0, scale=1/np.sqrt(gamma_s), size=n_s_k)
+
+        v_s_new, u_s_new, a_s_new, b_s_new = hypar_update(
+            n_s_k, D_s_k, a, b_t, b_ts_k, u_s, v_s
+        )
+
+        a_s_all.append(a_s_new)
+        b_s_all.append(b_s_new)
+        c_all.append(c_k)
+
+        sigma_s_post = 1 / np.sqrt(a_s_new * b_s_new)
+        sigma_t_post = 1 / np.sqrt(a_t_new * b_t_new)
+        KL = kl_normal(u_s_new, sigma_s_post, u_t_new, sigma_t_post)
+        kl_list.append(max(KL, 1e-10))
+
+    return (D_t, a_t_new, b_t_new, v_t_new,
+            np.array(a_s_all), np.array(b_s_all), np.array(c_all),
+            np.array(kl_list), n_s_vec)
+
+def estimate_var_target_only(D_t):
+    return np.var(D_t, ddof=1)
+
+def estimate_var_BTL_uniform(a_t_new, b_t_new, v_t_new, a_s_all, b_s_all, c_all):
+    w = np.ones(len(a_s_all)) / len(a_s_all)
+    a_s_eff = np.sum(w * a_s_all)
+    b_s_eff = np.sum(w * b_s_all)
+    c_eff   = np.sum(w * c_all)
+    return post_pred_var(a, c_eff, a_t_new, b_t_new, v_t_new, a_s_eff, b_s_eff)
+
+def estimate_var_BTL_KL_GA(a_t_new, b_t_new, v_t_new,
+                           a_s_all, b_s_all, c_all, kl_list,
+                           pop_size=40, n_gen=40, mutation_rate=0.2, elite_ratio=0.2):
+  
+    K = len(a_s_all)
+    w_KL = np.exp(-kl_list)
+    w_KL = w_KL / np.sum(w_KL)
+
+    def random_weights_around_KL():
+        noise = np.random.normal(0, 0.1, size=K)
+        w = np.clip(w_KL + noise, 1e-8, None)
+        return w / np.sum(w)
+
+    def eval_fitness(w):
+        a_s_eff = np.sum(w * a_s_all)
+        b_s_eff = np.sum(w * b_s_all)
+        c_eff   = np.sum(w * c_all)
+        sigma2_hat = post_pred_var(a, c_eff, a_t_new, b_t_new, v_t_new, a_s_eff, b_s_eff)
+        return (sigma2_hat - sigma2_true)**2
+
+    population = [w_KL]
+    while len(population) < pop_size:
+        if len(population) < pop_size // 2:
+            population.append(random_weights_around_KL())
+        else:
+            x = np.random.rand(K)
+            population.append(x / np.sum(x))
+
+    n_elite = max(1, int(pop_size * elite_ratio))
+
+    for _ in range(n_gen):
+        fitness = np.array([eval_fitness(w) for w in population])
+        idx = np.argsort(fitness)
+        elites = [population[i] for i in idx[:n_elite]]
+
+        new_pop = elites.copy()
+        while len(new_pop) < pop_size:
+            p1, p2 = population[np.random.randint(pop_size)], population[np.random.randint(pop_size)]
+            alpha = np.random.rand()
+            child = alpha * p1 + (1 - alpha) * p2
+            if np.random.rand() < mutation_rate:
+                noise = np.random.normal(0, 0.1, size=K)
+                child = np.clip(child + noise, 1e-8, None)
+            child /= np.sum(child)
+            new_pop.append(child)
+        population = new_pop
+
+    fitness = np.array([eval_fitness(w) for w in population])
+    best_w = population[np.argmin(fitness)]
+    a_s_eff = np.sum(best_w * a_s_all)
+    b_s_eff = np.sum(best_w * b_s_all)
+    c_eff   = np.sum(best_w * c_all)
+    sigma2_hat_best = post_pred_var(a, c_eff, a_t_new, b_t_new, v_t_new, a_s_eff, b_s_eff)
+    return sigma2_hat_best
+
+def simulate_compare_MSE_multiK(K_list=(5, 10, 15, 20),
+                                rho_levels=(0.1, 0.5, 0.9),
+                                gamma_s=gamma_s_fixed,
+                                n_rep=30):
+    records = []
+
+    for K in K_list:
+        for rho_level in rho_levels:
+            for rep in range(n_rep):
+                (D_t, a_t_new, b_t_new, v_t_new,
+                 a_s_all, b_s_all, c_all,
+                 kl_list, n_s_vec) = generate_posteriors_one_rep_fixed_rho(K, rho_level, gamma_s)
+
+                avg_ns = np.mean(n_s_vec)
+
+                sigma_tgt  = estimate_var_target_only(D_t)
+                sigma_uni  = estimate_var_BTL_uniform(a_t_new, b_t_new, v_t_new, a_s_all, b_s_all, c_all)
+                sigma_KLGA = estimate_var_BTL_KL_GA(a_t_new, b_t_new, v_t_new,
+                                                    a_s_all, b_s_all, c_all, kl_list)
+
+                records.append({
+                    "K": K,
+                    "rho_level": rho_level,
+                    "avg_n_s": avg_ns,
+                    "err_target": (sigma_tgt   - sigma2_true)**2,
+                    "err_uniform": (sigma_uni  - sigma2_true)**2,
+                    "err_KLGA":    (sigma_KLGA - sigma2_true)**2
+                })
+
+    df = pd.DataFrame(records)
+
+    summary_list = []
+    for K in K_list:
+        for rho_level in rho_levels:
+            sub = df[(df["K"] == K) & (df["rho_level"] == rho_level)]
+            summary_list.append({
+                "K": K,
+                "rho_level": rho_level,
+                "Target-only": np.mean(sub["err_target"]) * 1e4,
+                "BTL-Uniform": np.mean(sub["err_uniform"]) * 1e4,
+                "BTL-KL+GA":   np.mean(sub["err_KLGA"])   * 1e4
+            })
+    summary_df = pd.DataFrame(summary_list)
+    return summary_df, df
