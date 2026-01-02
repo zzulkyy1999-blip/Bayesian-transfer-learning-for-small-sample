@@ -1,3 +1,4 @@
+#Results under different k values and different rho values
 import numpy as np
 from scipy.stats import norm
 import mpmath as mh
