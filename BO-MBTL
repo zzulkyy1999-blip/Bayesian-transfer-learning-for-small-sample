@@ -5,16 +5,8 @@ from scipy.stats import norm
 from scipy.optimize import minimize
 import warnings
 
-# 忽略一些 sklearn 的收敛警告，保持输出整洁
 warnings.filterwarnings("ignore")
 
-# =====================================================
-# 1. 核心数学模型 (Property 2 from paper)
-# =====================================================
-def hypar_update(n, D, a, b, b_ts, u, v):
-    """
-    根据论文公式更新超参数
-    """
     if n == 0: 
         return v, u, a, b
 
@@ -37,17 +29,13 @@ def hypar_update(n, D, a, b, b_ts, u, v):
 def mape(y_true, y_pred):
     return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
 
-# =====================================================
-# 2. 多源域贝叶斯迁移类 (基于贝叶斯优化 BO)
-# =====================================================
 class MultiSourceBayesianTransferBO:
     def __init__(self, target_train, source_datasets, rho_map):
         self.target_train = target_train
         self.source_datasets = source_datasets
         self.source_names = list(source_datasets.keys())
         self.rho_map = rho_map
-        
-        # 预计算
+   
         self.source_means = []
         self.source_bts = []
         
@@ -70,10 +58,7 @@ class MultiSourceBayesianTransferBO:
         self.source_bts = np.array(self.source_bts)
 
     def _normalize_weights(self, raw_weights):
-        """
-        将原始搜索空间的数值归一化为和为1的权重
-        """
-        # 使用 Softmax 或 简单的 abs/sum。这里用 abs/sum 保证非负
+       
         abs_w = np.abs(raw_weights)
         sum_w = np.sum(abs_w)
         if sum_w == 0:
@@ -81,7 +66,7 @@ class MultiSourceBayesianTransferBO:
         return abs_w / sum_w
 
     def _predict_with_weights(self, weights, train_data):
-        # 归一化权重
+   
         w_norm = self._normalize_weights(weights)
         
         u_prior_mixed = np.sum(w_norm * self.source_means)
@@ -98,10 +83,7 @@ class MultiSourceBayesianTransferBO:
         return u_t_star
 
     def objective_function(self, weights):
-        """
-        目标函数：LOO-CV MAPE
-        BO 需要最小化这个值 (或者最大化负值)
-        """
+       
         errors = []
         n = len(self.target_train)
         
@@ -118,15 +100,11 @@ class MultiSourceBayesianTransferBO:
         return np.mean(errors)
 
     def _expected_improvement(self, X, X_sample, Y_sample, gp, xi=0.01):
-        """
-        采集函数：期望提升 (Expected Improvement, EI)
-        """
+      
         mu, sigma = gp.predict(X, return_std=True)
-        # BO 习惯求最大值，我们的目标是 MAPE 越小越好。
-        # 所以我们实际上是在建模 -MAPE，或者寻找最小 MAPE。
-        # 这里假设我们是在寻找最小 MAPE (y_best 是当前的最小值)
+      
         
-        mu_sample_opt = np.min(Y_sample) # 当前已知的最优（最小）MAPE
+        mu_sample_opt = np.min(Y_sample) 
 
         with np.errstate(divide='warn'):
             imp = mu_sample_opt - mu - xi
@@ -137,39 +115,30 @@ class MultiSourceBayesianTransferBO:
         return ei
 
     def optimize_weights_bo(self, n_iters=20, n_initial=5):
-        """
-        手动实现的贝叶斯优化循环
-        """
+      
         n_dims = len(self.source_names)
         bounds = np.array([[0.0, 1.0]] * n_dims)
         
-        # 1. 初始化数据 (随机采样)
         X_sample = np.random.uniform(0, 1, size=(n_initial, n_dims))
         Y_sample = np.array([self.objective_function(x) for x in X_sample])
         
-        # 定义高斯过程的核函数 (Matern Kernel 适合平滑函数)
         kernel = C(1.0, (1e-3, 1e3)) * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2), nu=2.5)
         gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True, random_state=42)
 
-        # 2. BO 主循环
         for i in range(n_iters):
-            # A. 拟合高斯过程
+           
             gp.fit(X_sample, Y_sample)
             
-            # B. 最大化采集函数 (寻找下一个探测点)
-            # 由于维度较高(15维)，直接网格搜索太慢，我们使用随机采样+L-BFGS-B优化
             def min_obj(X):
-                # 最小化 (-EI) 等同于 最大化 EI
+                
                 return -self._expected_improvement(X.reshape(1, -1), X_sample, Y_sample, gp)
             
-            # 随机生成候选点作为优化的起点
             candidates = np.random.uniform(0, 1, size=(50, n_dims))
             min_val = float('inf')
             next_x = None
             
-            # 从候选点中找几个最好的进行微调
             ei_values = self._expected_improvement(candidates, X_sample, Y_sample, gp)
-            best_candidates_idx = np.argsort(ei_values)[-3:] # 取EI最大的3个
+            best_candidates_idx = np.argsort(ei_values)[-3:] 
             
             for idx in best_candidates_idx:
                 res = minimize(min_obj, x0=candidates[idx], bounds=bounds, method='L-BFGS-B')
@@ -177,17 +146,14 @@ class MultiSourceBayesianTransferBO:
                     min_val = res.fun
                     next_x = res.x
             
-            if next_x is None: # 兜底
+            if next_x is None: 
                 next_x = candidates[0]
 
-            # C. 评估真实目标函数
             next_y = self.objective_function(next_x)
             
-            # D. 更新数据
             X_sample = np.vstack((X_sample, next_x))
             Y_sample = np.append(Y_sample, next_y)
-            
-        # 返回最优结果
+   
         best_idx = np.argmin(Y_sample)
         best_raw_weights = X_sample[best_idx]
         best_mape = Y_sample[best_idx]
@@ -195,7 +161,7 @@ class MultiSourceBayesianTransferBO:
         return self._normalize_weights(best_raw_weights), best_mape
 
     def predict(self, best_norm_weights):
-        # 复用预测逻辑，注意此时传入的 weights 已经是归一化后的
+       
         u_prior_mixed = np.sum(best_norm_weights * self.source_means)
         b_ts_mixed = np.sum(best_norm_weights * self.source_bts)
         
@@ -207,18 +173,15 @@ class MultiSourceBayesianTransferBO:
         )
         return u_t_star
 
-# =====================================================
-# 3. 主程序
-# =====================================================
 if __name__ == "__main__":
-    # 目标域数据
+  
     target_data = {
         "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
         "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
         "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
     }
 
-    # 所有源域数据
+   
     source_datasets_raw = {
         "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
         "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
@@ -252,15 +215,13 @@ if __name__ == "__main__":
 
     for prop in ["Compressive", "Failure", "Yield"]:
         prop_sources = {k: np.array(v[prop]) for k, v in source_datasets_raw.items()}
-        
-        # 使用 BO 优化器
+      
         optimizer = MultiSourceBayesianTransferBO(
             target_train=target_data[prop]["train"],
             source_datasets=prop_sources,
             rho_map=rho_map
         )
-        
-        # 运行 BO (迭代次数较少，例如25次，因为BO效率高)
+      
         best_norm_weights, min_loo_error = optimizer.optimize_weights_bo(n_iters=25, n_initial=5)
         
         final_pred = optimizer.predict(best_norm_weights)
