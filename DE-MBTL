@@ -1,14 +1,8 @@
 import numpy as np
 from scipy.optimize import differential_evolution
 
-# =====================================================
-# 1. 核心数学模型 (Property 2 from paper)
-# =====================================================
 def hypar_update(n, D, a, b, b_ts, u, v):
-    """
-    根据论文公式更新超参数
-    """
-    if n == 0: # 保护：如果没有数据
+    if n == 0: 
         return v, u, a, b
 
     x_bar = np.mean(D)
@@ -30,37 +24,24 @@ def hypar_update(n, D, a, b, b_ts, u, v):
 def mape(y_true, y_pred):
     """Mean Absolute Percentage Error."""
     return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-
-# =====================================================
-# 2. 多源域贝叶斯迁移类
-# =====================================================
 class MultiSourceBayesianTransfer:
     def __init__(self, target_train, source_datasets, rho_map):
         self.target_train = target_train
         self.source_datasets = source_datasets
         self.source_names = list(source_datasets.keys())
         self.rho_map = rho_map
-        
-        # 预计算每个源域的均值和 b_ts 参数，加速后续优化
         self.source_means = []
         self.source_bts = []
-        
-        # 固定超参数 (可根据需要调整)
         self.a = 10
         self.b_t = 1
         self.b_s = 1
         self.v_t = 10
-        self.v_s = 10 # 用于计算源域自身更新，但在融合时主要用源域均值
-        
+        self.v_s = 10 
         for name in self.source_names:
             D_s = self.source_datasets[name]
             rho = self.rho_map.get(name, 0.9) # Default rho
-            
-            # 计算源域均值
             u_s = np.mean(D_s)
             self.source_means.append(u_s)
-            
-            # 计算源域对应的 b_ts
             b_ts = (1 - rho) * self.b_t * self.b_s
             self.source_bts.append(b_ts)
             
@@ -68,29 +49,12 @@ class MultiSourceBayesianTransfer:
         self.source_bts = np.array(self.source_bts)
 
     def _predict_with_weights(self, weights, train_data):
-        """
-        给定权重和训练数据，预测后验均值。
-        weights: 原始权重向量 (优化器输出)
-        train_data: 用于更新的目标域数据
-        """
-        # 1. 权重归一化 (Softmax 或 L1 归一化)
-        # 使用 L1 归一化确保和为 1，且非负 (DE bounds 设为 0-1)
         w_norm = weights / (np.sum(weights) + 1e-9)
-        
-        # 2. 融合源域信息构建先验 (Mixture of Sources)
-        # 混合先验均值
         u_prior_mixed = np.sum(w_norm * self.source_means)
-        
-        # 混合迁移尺度 b_ts (启发式：加权平均)
         b_ts_mixed = np.sum(w_norm * self.source_bts)
-        
-        # 3. 贝叶斯更新 (Target Update)
         n_t = len(train_data)
-        # 如果训练集为空（LOO极其特殊情况），直接返回先验
         if n_t == 0:
             return u_prior_mixed
-
-        # 这里的 u_prior 传入的是 mixed source mean
         _, u_t_star, _, _ = hypar_update(
             n_t, train_data, 
             self.a, self.b_s, b_ts_mixed, 
@@ -99,41 +63,31 @@ class MultiSourceBayesianTransfer:
         return u_t_star
 
     def objective_function(self, weights):
-        """
-        优化目标函数：留一法交叉验证 (LOO-CV) 的 MAPE
-        """
+       
         errors = []
         n = len(self.target_train)
         
-        # 如果数据太少(<2)，无法做LOO，直接拟合全部
         if n < 2:
             pred = self._predict_with_weights(weights, self.target_train)
             return mape(self.target_train, pred) # 这种情况下其实是拟合误差，不太好
             
-        # Leave-One-Out Cross Validation
         for i in range(n):
-            # 验证集：第 i 个样本
+           
             val_sample = self.target_train[i]
             
-            # 训练集：除了第 i 个样本以外的所有样本
             train_subset = np.delete(self.target_train, i)
-            
-            # 预测
+           
             pred = self._predict_with_weights(weights, train_subset)
             
-            # 记录误差
             errors.append(mape(val_sample, pred))
             
         return np.mean(errors)
 
     def optimize_weights_de(self):
-        """
-        使用差分进化 (Differential Evolution) 寻找最优权重
-        """
+       
         n_sources = len(self.source_names)
         bounds = [(0, 1)] * n_sources
         
-        # 运行 DE
         result = differential_evolution(
             self.objective_function, 
             bounds, 
@@ -147,26 +101,22 @@ class MultiSourceBayesianTransfer:
         )
         
         best_weights = result.x
-        # 归一化最优权重以便查看
+       
         norm_weights = best_weights / (np.sum(best_weights) + 1e-9)
         return norm_weights, result.fun
 
     def predict(self, best_weights):
-        """使用最优权重对当前所有目标训练数据进行最终预测"""
+       
         return self._predict_with_weights(best_weights, self.target_train)
 
-# =====================================================
-# 3. 主程序
-# =====================================================
 if __name__ == "__main__":
-    # 目标域数据
+  
     target_data = {
         "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
         "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
         "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
     }
 
-    # 所有源域数据
     source_datasets_raw = {
         "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
         "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
@@ -187,7 +137,6 @@ if __name__ == "__main__":
         "H5": {"Compressive": [6112, 6258, 6298, 6292, 6386], "Failure": [5802, 5946, 5978, 5978, 6066], "Yield": [5016, 5122, 5116, 5066, 5208]}
     }
 
-    # 设置每个源域的 Rho
     rho_map = {}
     for name in source_datasets_raw.keys():
         if name.startswith("L"): rho_map[name] = 0.1
@@ -199,33 +148,26 @@ if __name__ == "__main__":
 
     total_mape = 0
 
-    # 对每个属性分别进行多源域融合
     for prop in ["Compressive", "Failure", "Yield"]:
-        # 1. 准备该属性的所有源数据
+       
         prop_sources = {k: np.array(v[prop]) for k, v in source_datasets_raw.items()}
         
-        # 2. 初始化优化器
         optimizer = MultiSourceBayesianTransfer(
             target_train=target_data[prop]["train"],
             source_datasets=prop_sources,
             rho_map=rho_map
         )
-        
-        # 3. 运行差分进化 (DE) 寻找最优权重
-        # 这里使用了 DE 算法，对应你提到的 Recommendation #2
+      
         best_weights, min_loo_error = optimizer.optimize_weights_de()
         
-        # 4. 使用最优权重预测 Test Set
         final_pred = optimizer.predict(best_weights)
         true_val = target_data[prop]["test"]
         test_error = mape(true_val, final_pred)
         total_mape += test_error
         
-        # 打印 top 3 权重的源域 (Debug info)
         sorted_indices = np.argsort(best_weights)[::-1]
         top_sources = [f"{optimizer.source_names[i]}({best_weights[i]:.2f})" for i in sorted_indices[:3]]
         top_sources_str = ", ".join(top_sources)
-
         print(f"{prop:<15} | {true_val:<10} | {final_pred:<10.2f} | {test_error:<9.2f}% | Top: {top_sources_str}")
 
     print("-" * 75)
