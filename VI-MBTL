@@ -1,0 +1,258 @@
+import numpy as np
+
+# =====================================================
+# 1. 核心数学模型 (Property 2 from paper)
+# =====================================================
+def hypar_update(n, D, a, b, b_ts, u, v):
+    """
+    根据论文公式更新超参数
+    """
+    if n == 0: 
+        return v, u, a, b
+
+    x_bar = np.mean(D)
+    S = np.var(D, ddof=0) 
+
+    v_new = v + n
+    u_new = (v * u + n * x_bar) / (v + n)
+    a_new = a + n / 2
+    
+    # 注意：在当前的预测逻辑中，u_new 的计算其实并不依赖 b_ts
+    # 但为了完整性保留 b_ts 的计算路径
+    denom_term = (b / b_ts) + (n * S / 2) + (n * v * (x_bar - u) ** 2 / (2 * (n + v)))
+    
+    if denom_term == 0:
+        b_new = b 
+    else:
+        b_new = 1.0 / denom_term
+
+    return v_new, u_new, a_new, b_new
+
+def mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+# =====================================================
+# 2. 多源域贝叶斯迁移类 (基于 VI/梯度优化)
+# =====================================================
+class MultiSourceBayesianTransferVI:
+    def __init__(self, target_train, source_datasets, rho_map):
+        self.target_train = target_train
+        self.source_datasets = source_datasets
+        self.source_names = list(source_datasets.keys())
+        self.rho_map = rho_map
+        
+        # 预计算
+        self.source_means = []
+        self.source_bts = []
+        
+        self.a = 10
+        self.b_t = 1
+        self.b_s = 1
+        self.v_t = 10
+        
+        for name in self.source_names:
+            D_s = self.source_datasets[name]
+            rho = self.rho_map.get(name, 0.9)
+            
+            u_s = np.mean(D_s)
+            self.source_means.append(u_s)
+            
+            b_ts = (1 - rho) * self.b_t * self.b_s
+            self.source_bts.append(b_ts)
+            
+        self.source_means = np.array(self.source_means)
+        self.source_bts = np.array(self.source_bts)
+
+    def softmax(self, logits):
+        """数值稳定的 Softmax"""
+        exp_x = np.exp(logits - np.max(logits))
+        return exp_x / np.sum(exp_x)
+
+    def _predict_with_weights(self, weights, train_data):
+        """前向传播：根据权重预测"""
+        # 混合先验
+        u_prior_mixed = np.sum(weights * self.source_means)
+        b_ts_mixed = np.sum(weights * self.source_bts)
+        
+        n_t = len(train_data)
+        if n_t == 0: return u_prior_mixed
+
+        # 贝叶斯更新
+        _, u_t_star, _, _ = hypar_update(
+            n_t, train_data, 
+            self.a, self.b_s, b_ts_mixed, 
+            u_prior_mixed, self.v_t
+        )
+        return u_t_star
+
+    def _compute_loss_and_gradients(self, logits):
+        """
+        计算 LOO-CV MAPE 损失以及相对于 logits 的梯度
+        这是一个手动实现的反向传播过程
+        """
+        weights = self.softmax(logits)
+        n_sources = len(weights)
+        n_data = len(self.target_train)
+        
+        total_loss = 0
+        grad_logits = np.zeros_like(logits)
+        
+        # 对于 LOO-CV 中的每一个样本
+        for i in range(n_data):
+            val_sample = self.target_train[i]
+            train_subset = np.delete(self.target_train, i)
+            n_subset = len(train_subset)
+            x_bar_subset = np.mean(train_subset) if n_subset > 0 else 0
+            
+            # --- Forward Pass (前向传播) ---
+            # 1. 计算混合先验均值 u_prior
+            u_prior = np.dot(weights, self.source_means)
+            
+            # 2. 计算后验预测 u_star
+            # u_star = (v * u_prior + n * x_bar) / (v + n)
+            # 简化系数 k = v / (v + n)
+            k = self.v_t / (self.v_t + n_subset)
+            u_star = k * u_prior + (n_subset * x_bar_subset) / (self.v_t + n_subset)
+            
+            # 3. 计算 Loss (MAPE)
+            # L = |u_star - y| / y * 100
+            diff = u_star - val_sample
+            loss = np.abs(diff) / val_sample * 100
+            total_loss += loss
+            
+            # --- Backward Pass (反向传播) ---
+            # 链式法则: dL/d(logits) = dL/d(u_star) * d(u_star)/d(u_prior) * d(u_prior)/d(weights) * d(weights)/d(logits)
+            
+            # 1. dL / d(u_star)
+            # d(|x|)/dx = sign(x)
+            grad_u_star = (np.sign(diff) / val_sample * 100)
+            
+            # 2. d(u_star) / d(u_prior) = k
+            grad_u_prior = grad_u_star * k
+            
+            # 3. d(u_prior) / d(weights) = source_means
+            grad_weights = grad_u_prior * self.source_means # 这是一个向量
+            
+            # 4. d(weights) / d(logits) = Jacobian of Softmax
+            # Jacobian J_ij = w_i * (delta_ij - w_j)
+            # 向量化计算: dL/d(theta_i) = sum_j (dL/dw_j * dw_j/dtheta_i)
+            #           = w_i * (dL/dw_i - sum(dL/dw * w))
+            sum_grad_w_dot_w = np.dot(grad_weights, weights)
+            current_grad_logits = weights * (grad_weights - sum_grad_w_dot_w)
+            
+            grad_logits += current_grad_logits
+            
+        avg_loss = total_loss / n_data
+        avg_grad = grad_logits / n_data
+        
+        return avg_loss, avg_grad
+
+    def optimize_weights_vi(self, learning_rate=0.1, n_iters=200):
+        """
+        使用 Adam 优化器最小化 MAPE Loss
+        """
+        n_dim = len(self.source_names)
+        # 初始化 logits (全0 => 初始权重均匀分布)
+        logits = np.zeros(n_dim)
+        
+        # Adam 参数
+        beta1 = 0.9
+        beta2 = 0.999
+        epsilon = 1e-8
+        m = np.zeros(n_dim)
+        v = np.zeros(n_dim)
+        
+        loss_history = []
+        
+        for t in range(1, n_iters + 1):
+            loss, grads = self._compute_loss_and_gradients(logits)
+            loss_history.append(loss)
+            
+            # Adam Update
+            m = beta1 * m + (1 - beta1) * grads
+            v = beta2 * v + (1 - beta2) * (grads ** 2)
+            
+            m_hat = m / (1 - beta1 ** t)
+            v_hat = v / (1 - beta2 ** t)
+            
+            logits -= learning_rate * m_hat / (np.sqrt(v_hat) + epsilon)
+            
+            # 早停机制
+            if t > 20 and np.abs(loss_history[-1] - loss_history[-2]) < 1e-6:
+                break
+                
+        # 返回最终变换后的权重
+        final_weights = self.softmax(logits)
+        return final_weights, loss_history[-1]
+
+    def predict(self, best_weights):
+        return self._predict_with_weights(best_weights, self.target_train)
+
+# =====================================================
+# 3. 主程序
+# =====================================================
+if __name__ == "__main__":
+    # 目标域数据
+    target_data = {
+        "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
+        "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
+        "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
+    }
+
+    # 所有源域数据
+    source_datasets_raw = {
+        "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
+        "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
+        "L3": {"Compressive": [5276, 5326, 5354, 5250, 5300], "Failure": [4748, 4784, 4814, 4726, 4764], "Yield": [4038, 4062, 4100, 3994, 4028]},
+        "L4": {"Compressive": [7568, 7574, 7608, 7496, 7580], "Failure": [6816, 6816, 6842, 6744, 6820], "Yield": [5702, 5636, 5616, 5574, 5624]},
+        "L5": {"Compressive": [4788, 4726, 4814, 4816, 4750], "Failure": [4544, 4486, 4570, 4572, 4510], "Yield": [4520, 4478, 4532, 4554, 4500]},
+        
+        "M1": {"Compressive": [6496, 6580, 6536, 6486, 6484], "Failure": [6168, 6248, 6212, 6164, 6160], "Yield": [5532, 5574, 5540, 5520, 5580]},
+        "M2": {"Compressive": [7598, 7540, 7738, 7678, 7632], "Failure": [7220, 7162, 7350, 7306, 7248], "Yield": [6312, 6336, 6412, 6302, 6368]},
+        "M3": {"Compressive": [5608, 5736, 5722, 5630, 5482], "Failure": [5326, 5448, 5426, 5348, 5206], "Yield": [4896, 5010, 5014, 4910, 4886]},
+        "M4": {"Compressive": [6510, 6650, 6630, 6532, 6426], "Failure": [6184, 6318, 6296, 6204, 6102], "Yield": [5360, 5520, 5508, 5390, 5332]},
+        "M5": {"Compressive": [6528, 6554, 6568, 6616, 6570], "Failure": [6200, 6228, 6238, 6288, 6240], "Yield": [5604, 5628, 5572, 5652, 5646]},
+        
+        "H1": {"Compressive": [6500, 6594, 6526, 6456, 6526], "Failure": [6170, 6272, 6194, 6128, 6196], "Yield": [5378, 5442, 5436, 5322, 5368]},
+        "H2": {"Compressive": [6632, 6636, 6584, 6572, 6572], "Failure": [6300, 6302, 6254, 6240, 6236], "Yield": [5606, 5534, 5626, 5552, 5552]},
+        "H3": {"Compressive": [6568, 6558, 6516, 6564, 6410], "Failure": [6236, 6230, 6184, 6238, 6088], "Yield": [5358, 5350, 5244, 5372, 5266]},
+        "H4": {"Compressive": [6474, 6522, 6458, 6536, 6388], "Failure": [6146, 6194, 6140, 6206, 6066], "Yield": [5310, 5294, 5252, 5326, 5218]},
+        "H5": {"Compressive": [6112, 6258, 6298, 6292, 6386], "Failure": [5802, 5946, 5978, 5978, 6066], "Yield": [5016, 5122, 5116, 5066, 5208]}
+    }
+
+    rho_map = {}
+    for name in source_datasets_raw.keys():
+        if name.startswith("L"): rho_map[name] = 0.1
+        elif name.startswith("M"): rho_map[name] = 0.5
+        elif name.startswith("H"): rho_map[name] = 0.9
+
+    print(f"{'Property':<15} | {'True Value':<10} | {'Pred Value':<10} | {'Test MAPE':<10} | {'Optimization':<15}")
+    print("-" * 75)
+
+    total_mape = 0
+
+    for prop in ["Compressive", "Failure", "Yield"]:
+        prop_sources = {k: np.array(v[prop]) for k, v in source_datasets_raw.items()}
+        
+        optimizer = MultiSourceBayesianTransferVI(
+            target_train=target_data[prop]["train"],
+            source_datasets=prop_sources,
+            rho_map=rho_map
+        )
+        
+        # 运行 Adam 优化 (VI)
+        best_weights, final_loss = optimizer.optimize_weights_vi(learning_rate=0.2, n_iters=100)
+        
+        final_pred = optimizer.predict(best_weights)
+        true_val = target_data[prop]["test"]
+        test_error = mape(true_val, final_pred)
+        total_mape += test_error
+        
+        sorted_indices = np.argsort(best_weights)[::-1]
+        top_sources = [f"{optimizer.source_names[i]}({best_weights[i]:.2f})" for i in sorted_indices[:3]]
+        top_sources_str = ", ".join(top_sources)
+
+        print(f"{prop:<15} | {true_val:<10} | {final_pred:<10.2f} | {test_error:<9.2f}% | Top: {top_sources_str}")
+
+    print("-" * 75)
+    print(f"Average Test MAPE (Multi-Source VI/Adam Optimized): {total_mape / 3:.2f}%")
