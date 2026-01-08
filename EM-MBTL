@@ -1,13 +1,8 @@
 import numpy as np
 from scipy.stats import norm
 
-# =====================================================
-# 1. 核心数学模型 (Property 2 from paper)
-# =====================================================
 def hypar_update(n, D, a, b, b_ts, u, v):
-    """
-    根据论文公式更新超参数
-    """
+   
     if n == 0: 
         return v, u, a, b
 
@@ -30,9 +25,6 @@ def hypar_update(n, D, a, b, b_ts, u, v):
 def mape(y_true, y_pred):
     return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
 
-# =====================================================
-# 2. 多源域贝叶斯迁移类 (基于 EM 算法)
-# =====================================================
 class MultiSourceBayesianTransferEM:
     def __init__(self, target_train, source_datasets, rho_map):
         self.target_train = target_train
@@ -40,12 +32,10 @@ class MultiSourceBayesianTransferEM:
         self.source_names = list(source_datasets.keys())
         self.rho_map = rho_map
         
-        # 预计算源域统计量
         self.source_means = []
-        self.source_stds = [] # 用于计算似然
+        self.source_stds = [] 
         self.source_bts = []
         
-        # 固定超参数
         self.a = 10
         self.b_t = 1
         self.b_s = 1
@@ -55,17 +45,13 @@ class MultiSourceBayesianTransferEM:
             D_s = self.source_datasets[name]
             rho = self.rho_map.get(name, 0.9)
             
-            # 计算源域均值
             u_s = np.mean(D_s)
             self.source_means.append(u_s)
             
-            # 计算源域标准差 (用于 EM 中的似然计算)
-            # 这里我们假设源域的标准差可以反映其分布的“宽度”
             std_s = np.std(D_s, ddof=1)
-            if std_s == 0: std_s = 1e-6 # 防止除零
+            if std_s == 0: std_s = 1e-6 
             self.source_stds.append(std_s)
             
-            # 计算 b_ts
             b_ts = (1 - rho) * self.b_t * self.b_s
             self.source_bts.append(b_ts)
             
@@ -74,55 +60,36 @@ class MultiSourceBayesianTransferEM:
         self.source_bts = np.array(self.source_bts)
 
     def optimize_weights_em(self, max_iter=100, tol=1e-5):
-        """
-        使用 EM 算法优化权重
-        """
+       
         n_sources = len(self.source_names)
         n_samples = len(self.target_train)
         
-        # 初始化权重 (均匀分布)
         weights = np.ones(n_sources) / n_sources
         
-        # 记录 Log-Likelihood 以判断收敛
         log_likelihood_history = []
         
         for iteration in range(max_iter):
-            # ------------------------------------------------
-            # E-step (Expectation): 计算责任度 (Responsibilities)
-            # gamma[i, k] 表示第 k 个源域对第 i 个目标样本的解释程度
-            # ------------------------------------------------
+           
             gamma = np.zeros((n_samples, n_sources))
             
             for i in range(n_samples):
                 x = self.target_train[i]
                 for k in range(n_sources):
-                    # 计算似然 P(x | source_k)
-                    # 这里假设源域 k 定义了一个高斯分布 N(u_s, sigma_s)
-                    # 我们计算目标样本 x 落在该分布中的概率密度
+                   
                     likelihood = norm.pdf(x, loc=self.source_means[k], scale=self.source_stds[k])
                     
-                    # 分子: w_k * P(x | k)
                     gamma[i, k] = weights[k] * likelihood
             
-            # 归一化 gamma (使得对每个样本，所有源域的责任度之和为 1)
             row_sums = gamma.sum(axis=1, keepdims=True)
-            # 防止除以零
+           
             row_sums[row_sums == 0] = 1e-10
             gamma = gamma / row_sums
             
-            # ------------------------------------------------
-            # M-step (Maximization): 更新权重
-            # 新权重是所有样本上责任度的平均值
-            # ------------------------------------------------
             new_weights = gamma.mean(axis=0)
             
-            # 确保权重非负且和为1 (数值稳定性)
             new_weights = np.maximum(new_weights, 0)
             new_weights /= (new_weights.sum() + 1e-10)
             
-            # ------------------------------------------------
-            # 收敛检测
-            # ------------------------------------------------
             diff = np.abs(new_weights - weights).sum()
             weights = new_weights
             
@@ -132,14 +99,10 @@ class MultiSourceBayesianTransferEM:
         return weights, iteration
 
     def predict(self, weights):
-        """
-        使用优化后的权重进行最终预测
-        """
-        # 1. 混合源域先验
+       
         u_prior_mixed = np.sum(weights * self.source_means)
         b_ts_mixed = np.sum(weights * self.source_bts)
         
-        # 2. 贝叶斯更新
         n_t = len(self.target_train)
         _, u_t_star, _, _ = hypar_update(
             n_t, self.target_train, 
@@ -148,18 +111,14 @@ class MultiSourceBayesianTransferEM:
         )
         return u_t_star
 
-# =====================================================
-# 3. 主程序
-# =====================================================
 if __name__ == "__main__":
-    # 目标域数据
+    
     target_data = {
         "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
         "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
         "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
     }
 
-    # 所有源域数据
     source_datasets_raw = {
         "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
         "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
@@ -200,7 +159,6 @@ if __name__ == "__main__":
             rho_map=rho_map
         )
         
-        # 运行 EM 算法
         weights, iterations = optimizer.optimize_weights_em()
         
         final_pred = optimizer.predict(weights)
@@ -208,7 +166,6 @@ if __name__ == "__main__":
         test_error = mape(true_val, final_pred)
         total_mape += test_error
         
-        # 排序并显示权重最高的源域
         sorted_indices = np.argsort(weights)[::-1]
         top_sources = [f"{optimizer.source_names[i]}({weights[i]:.2f})" for i in sorted_indices[:3]]
         top_sources_str = ", ".join(top_sources)
