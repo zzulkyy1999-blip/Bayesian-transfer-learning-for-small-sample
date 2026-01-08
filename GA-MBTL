@@ -1,0 +1,250 @@
+import numpy as np
+import copy
+
+# =====================================================
+# 1. 核心数学模型 (Property 2 from paper)
+# =====================================================
+def hypar_update(n, D, a, b, b_ts, u, v):
+    """
+    根据论文公式更新超参数
+    """
+    if n == 0: 
+        return v, u, a, b
+
+    x_bar = np.mean(D)
+    S = np.var(D, ddof=0) 
+
+    v_new = v + n
+    u_new = (v * u + n * x_bar) / (v + n)
+    a_new = a + n / 2
+    
+    denom_term = (b / b_ts) + (n * S / 2) + (n * v * (x_bar - u) ** 2 / (2 * (n + v)))
+    
+    if denom_term == 0:
+        b_new = b 
+    else:
+        b_new = 1.0 / denom_term
+
+    return v_new, u_new, a_new, b_new
+
+def mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+# =====================================================
+# 2. 多源域贝叶斯迁移类 (基于 GA)
+# =====================================================
+class MultiSourceBayesianTransferGA:
+    def __init__(self, target_train, source_datasets, rho_map):
+        self.target_train = target_train
+        self.source_datasets = source_datasets
+        self.source_names = list(source_datasets.keys())
+        self.rho_map = rho_map
+        
+        # 预计算
+        self.source_means = []
+        self.source_bts = []
+        
+        self.a = 10
+        self.b_t = 1
+        self.b_s = 1
+        self.v_t = 10
+        
+        for name in self.source_names:
+            D_s = self.source_datasets[name]
+            rho = self.rho_map.get(name, 0.9)
+            
+            u_s = np.mean(D_s)
+            self.source_means.append(u_s)
+            
+            b_ts = (1 - rho) * self.b_t * self.b_s
+            self.source_bts.append(b_ts)
+            
+        self.source_means = np.array(self.source_means)
+        self.source_bts = np.array(self.source_bts)
+
+    def _predict_with_weights(self, weights, train_data):
+        # 归一化权重 (L1 Norm)
+        w_norm = weights / (np.sum(weights) + 1e-9)
+        
+        u_prior_mixed = np.sum(w_norm * self.source_means)
+        b_ts_mixed = np.sum(w_norm * self.source_bts)
+        
+        n_t = len(train_data)
+        if n_t == 0: return u_prior_mixed
+
+        _, u_t_star, _, _ = hypar_update(
+            n_t, train_data, 
+            self.a, self.b_s, b_ts_mixed, 
+            u_prior_mixed, self.v_t
+        )
+        return u_t_star
+
+    def fitness_function(self, weights):
+        """
+        适应度函数：LOO-CV MAPE
+        GA通常求最大值，这里我们需要最小化MAPE，
+        但在内部逻辑中我们直接用MAPE作为cost，越小越好。
+        """
+        errors = []
+        n = len(self.target_train)
+        
+        if n < 2:
+            pred = self._predict_with_weights(weights, self.target_train)
+            return mape(self.target_train, pred)
+            
+        for i in range(n):
+            val_sample = self.target_train[i]
+            train_subset = np.delete(self.target_train, i)
+            pred = self._predict_with_weights(weights, train_subset)
+            errors.append(mape(val_sample, pred))
+            
+        return np.mean(errors) # Loss (Cost)
+
+    def optimize_weights_ga(self, pop_size=50, generations=100, mutation_rate=0.1, crossover_rate=0.8):
+        """
+        自定义实数编码遗传算法 (Real-coded GA)
+        """
+        n_genes = len(self.source_names)
+        
+        # 1. 初始化种群 (Initialization)
+        # 生成 0-1 之间的随机数
+        population = np.random.rand(pop_size, n_genes)
+        
+        best_solution = None
+        best_fitness = float('inf')
+        
+        # GA 主循环
+        for gen in range(generations):
+            fitness_scores = []
+            
+            # 2. 评估 (Evaluation)
+            for individual in population:
+                loss = self.fitness_function(individual)
+                fitness_scores.append(loss)
+                
+                # 更新全局最优 (Elitism)
+                if loss < best_fitness:
+                    best_fitness = loss
+                    best_solution = individual.copy()
+            
+            fitness_scores = np.array(fitness_scores)
+            
+            # 3. 选择 (Selection) - 锦标赛选择 (Tournament Selection)
+            new_population = []
+            for _ in range(pop_size):
+                # 随机选3个个体，取loss最小的那个
+                candidates_idx = np.random.choice(pop_size, 3, replace=False)
+                winner_idx = candidates_idx[np.argmin(fitness_scores[candidates_idx])]
+                new_population.append(population[winner_idx].copy())
+            
+            new_population = np.array(new_population)
+            
+            # 4. 交叉 (Crossover) - 算术交叉 (Arithmetic Crossover)
+            # 对相邻的成对个体进行交叉
+            for i in range(0, pop_size, 2):
+                if i+1 < pop_size and np.random.rand() < crossover_rate:
+                    parent1 = new_population[i]
+                    parent2 = new_population[i+1]
+                    
+                    # 混合因子 alpha
+                    alpha = np.random.rand()
+                    child1 = alpha * parent1 + (1 - alpha) * parent2
+                    child2 = (1 - alpha) * parent1 + alpha * parent2
+                    
+                    new_population[i] = child1
+                    new_population[i+1] = child2
+            
+            # 5. 变异 (Mutation) - 高斯变异 (Gaussian Mutation)
+            for i in range(pop_size):
+                if np.random.rand() < mutation_rate:
+                    # 随机选择一个基因进行微调
+                    gene_idx = np.random.randint(n_genes)
+                    mutation_val = np.random.normal(0, 0.1) # 均值0，标准差0.1的高斯噪声
+                    new_population[i, gene_idx] += mutation_val
+                    
+                    # 边界处理：保证权重非负（虽然归一化能处理负数，但保持非负物理意义更强）
+                    new_population[i, gene_idx] = max(0.0, new_population[i, gene_idx])
+
+            population = new_population
+            
+        # 返回归一化后的最优权重
+        norm_weights = best_solution / (np.sum(best_solution) + 1e-9)
+        return norm_weights, best_fitness
+
+    def predict(self, best_weights):
+        return self._predict_with_weights(best_weights, self.target_train)
+
+# =====================================================
+# 3. 主程序
+# =====================================================
+if __name__ == "__main__":
+    # 目标域数据
+    target_data = {
+        "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
+        "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
+        "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
+    }
+
+    # 所有源域数据
+    source_datasets_raw = {
+        "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
+        "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
+        "L3": {"Compressive": [5276, 5326, 5354, 5250, 5300], "Failure": [4748, 4784, 4814, 4726, 4764], "Yield": [4038, 4062, 4100, 3994, 4028]},
+        "L4": {"Compressive": [7568, 7574, 7608, 7496, 7580], "Failure": [6816, 6816, 6842, 6744, 6820], "Yield": [5702, 5636, 5616, 5574, 5624]},
+        "L5": {"Compressive": [4788, 4726, 4814, 4816, 4750], "Failure": [4544, 4486, 4570, 4572, 4510], "Yield": [4520, 4478, 4532, 4554, 4500]},
+        
+        "M1": {"Compressive": [6496, 6580, 6536, 6486, 6484], "Failure": [6168, 6248, 6212, 6164, 6160], "Yield": [5532, 5574, 5540, 5520, 5580]},
+        "M2": {"Compressive": [7598, 7540, 7738, 7678, 7632], "Failure": [7220, 7162, 7350, 7306, 7248], "Yield": [6312, 6336, 6412, 6302, 6368]},
+        "M3": {"Compressive": [5608, 5736, 5722, 5630, 5482], "Failure": [5326, 5448, 5426, 5348, 5206], "Yield": [4896, 5010, 5014, 4910, 4886]},
+        "M4": {"Compressive": [6510, 6650, 6630, 6532, 6426], "Failure": [6184, 6318, 6296, 6204, 6102], "Yield": [5360, 5520, 5508, 5390, 5332]},
+        "M5": {"Compressive": [6528, 6554, 6568, 6616, 6570], "Failure": [6200, 6228, 6238, 6288, 6240], "Yield": [5604, 5628, 5572, 5652, 5646]},
+        
+        "H1": {"Compressive": [6500, 6594, 6526, 6456, 6526], "Failure": [6170, 6272, 6194, 6128, 6196], "Yield": [5378, 5442, 5436, 5322, 5368]},
+        "H2": {"Compressive": [6632, 6636, 6584, 6572, 6572], "Failure": [6300, 6302, 6254, 6240, 6236], "Yield": [5606, 5534, 5626, 5552, 5552]},
+        "H3": {"Compressive": [6568, 6558, 6516, 6564, 6410], "Failure": [6236, 6230, 6184, 6238, 6088], "Yield": [5358, 5350, 5244, 5372, 5266]},
+        "H4": {"Compressive": [6474, 6522, 6458, 6536, 6388], "Failure": [6146, 6194, 6140, 6206, 6066], "Yield": [5310, 5294, 5252, 5326, 5218]},
+        "H5": {"Compressive": [6112, 6258, 6298, 6292, 6386], "Failure": [5802, 5946, 5978, 5978, 6066], "Yield": [5016, 5122, 5116, 5066, 5208]}
+    }
+
+    # 设置每个源域的 Rho
+    rho_map = {}
+    for name in source_datasets_raw.keys():
+        if name.startswith("L"): rho_map[name] = 0.1
+        elif name.startswith("M"): rho_map[name] = 0.5
+        elif name.startswith("H"): rho_map[name] = 0.9
+
+    print(f"{'Property':<15} | {'True Value':<10} | {'Pred Value':<10} | {'Test MAPE':<10} | {'Optimization':<15}")
+    print("-" * 75)
+
+    total_mape = 0
+
+    for prop in ["Compressive", "Failure", "Yield"]:
+        prop_sources = {k: np.array(v[prop]) for k, v in source_datasets_raw.items()}
+        
+        optimizer = MultiSourceBayesianTransferGA(
+            target_train=target_data[prop]["train"],
+            source_datasets=prop_sources,
+            rho_map=rho_map
+        )
+        
+        # 运行 GA
+        best_weights, min_loo_error = optimizer.optimize_weights_ga(
+            pop_size=50, 
+            generations=50,
+            mutation_rate=0.2, # 增加变异率以避免早熟
+            crossover_rate=0.8
+        )
+        
+        final_pred = optimizer.predict(best_weights)
+        true_val = target_data[prop]["test"]
+        test_error = mape(true_val, final_pred)
+        total_mape += test_error
+        
+        sorted_indices = np.argsort(best_weights)[::-1]
+        top_sources = [f"{optimizer.source_names[i]}({best_weights[i]:.2f})" for i in sorted_indices[:3]]
+        top_sources_str = ", ".join(top_sources)
+
+        print(f"{prop:<15} | {true_val:<10} | {final_pred:<10.2f} | {test_error:<9.2f}% | Top: {top_sources_str}")
+
+    print("-" * 75)
+    print(f"Average Test MAPE (Multi-Source GA Optimized): {total_mape / 3:.2f}%")
