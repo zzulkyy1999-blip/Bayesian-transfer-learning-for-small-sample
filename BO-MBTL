@@ -1,0 +1,278 @@
+import numpy as np
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel as C
+from scipy.stats import norm
+from scipy.optimize import minimize
+import warnings
+
+# 忽略一些 sklearn 的收敛警告，保持输出整洁
+warnings.filterwarnings("ignore")
+
+# =====================================================
+# 1. 核心数学模型 (Property 2 from paper)
+# =====================================================
+def hypar_update(n, D, a, b, b_ts, u, v):
+    """
+    根据论文公式更新超参数
+    """
+    if n == 0: 
+        return v, u, a, b
+
+    x_bar = np.mean(D)
+    S = np.var(D, ddof=0) 
+
+    v_new = v + n
+    u_new = (v * u + n * x_bar) / (v + n)
+    a_new = a + n / 2
+    
+    denom_term = (b / b_ts) + (n * S / 2) + (n * v * (x_bar - u) ** 2 / (2 * (n + v)))
+    
+    if denom_term == 0:
+        b_new = b 
+    else:
+        b_new = 1.0 / denom_term
+
+    return v_new, u_new, a_new, b_new
+
+def mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+# =====================================================
+# 2. 多源域贝叶斯迁移类 (基于贝叶斯优化 BO)
+# =====================================================
+class MultiSourceBayesianTransferBO:
+    def __init__(self, target_train, source_datasets, rho_map):
+        self.target_train = target_train
+        self.source_datasets = source_datasets
+        self.source_names = list(source_datasets.keys())
+        self.rho_map = rho_map
+        
+        # 预计算
+        self.source_means = []
+        self.source_bts = []
+        
+        self.a = 10
+        self.b_t = 1
+        self.b_s = 1
+        self.v_t = 10
+        
+        for name in self.source_names:
+            D_s = self.source_datasets[name]
+            rho = self.rho_map.get(name, 0.9)
+            
+            u_s = np.mean(D_s)
+            self.source_means.append(u_s)
+            
+            b_ts = (1 - rho) * self.b_t * self.b_s
+            self.source_bts.append(b_ts)
+            
+        self.source_means = np.array(self.source_means)
+        self.source_bts = np.array(self.source_bts)
+
+    def _normalize_weights(self, raw_weights):
+        """
+        将原始搜索空间的数值归一化为和为1的权重
+        """
+        # 使用 Softmax 或 简单的 abs/sum。这里用 abs/sum 保证非负
+        abs_w = np.abs(raw_weights)
+        sum_w = np.sum(abs_w)
+        if sum_w == 0:
+            return np.ones_like(raw_weights) / len(raw_weights)
+        return abs_w / sum_w
+
+    def _predict_with_weights(self, weights, train_data):
+        # 归一化权重
+        w_norm = self._normalize_weights(weights)
+        
+        u_prior_mixed = np.sum(w_norm * self.source_means)
+        b_ts_mixed = np.sum(w_norm * self.source_bts)
+        
+        n_t = len(train_data)
+        if n_t == 0: return u_prior_mixed
+
+        _, u_t_star, _, _ = hypar_update(
+            n_t, train_data, 
+            self.a, self.b_s, b_ts_mixed, 
+            u_prior_mixed, self.v_t
+        )
+        return u_t_star
+
+    def objective_function(self, weights):
+        """
+        目标函数：LOO-CV MAPE
+        BO 需要最小化这个值 (或者最大化负值)
+        """
+        errors = []
+        n = len(self.target_train)
+        
+        if n < 2:
+            pred = self._predict_with_weights(weights, self.target_train)
+            return mape(self.target_train, pred)
+            
+        for i in range(n):
+            val_sample = self.target_train[i]
+            train_subset = np.delete(self.target_train, i)
+            pred = self._predict_with_weights(weights, train_subset)
+            errors.append(mape(val_sample, pred))
+            
+        return np.mean(errors)
+
+    def _expected_improvement(self, X, X_sample, Y_sample, gp, xi=0.01):
+        """
+        采集函数：期望提升 (Expected Improvement, EI)
+        """
+        mu, sigma = gp.predict(X, return_std=True)
+        # BO 习惯求最大值，我们的目标是 MAPE 越小越好。
+        # 所以我们实际上是在建模 -MAPE，或者寻找最小 MAPE。
+        # 这里假设我们是在寻找最小 MAPE (y_best 是当前的最小值)
+        
+        mu_sample_opt = np.min(Y_sample) # 当前已知的最优（最小）MAPE
+
+        with np.errstate(divide='warn'):
+            imp = mu_sample_opt - mu - xi
+            Z = imp / sigma
+            ei = imp * norm.cdf(Z) + sigma * norm.pdf(Z)
+            ei[sigma == 0.0] = 0.0
+
+        return ei
+
+    def optimize_weights_bo(self, n_iters=20, n_initial=5):
+        """
+        手动实现的贝叶斯优化循环
+        """
+        n_dims = len(self.source_names)
+        bounds = np.array([[0.0, 1.0]] * n_dims)
+        
+        # 1. 初始化数据 (随机采样)
+        X_sample = np.random.uniform(0, 1, size=(n_initial, n_dims))
+        Y_sample = np.array([self.objective_function(x) for x in X_sample])
+        
+        # 定义高斯过程的核函数 (Matern Kernel 适合平滑函数)
+        kernel = C(1.0, (1e-3, 1e3)) * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2), nu=2.5)
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True, random_state=42)
+
+        # 2. BO 主循环
+        for i in range(n_iters):
+            # A. 拟合高斯过程
+            gp.fit(X_sample, Y_sample)
+            
+            # B. 最大化采集函数 (寻找下一个探测点)
+            # 由于维度较高(15维)，直接网格搜索太慢，我们使用随机采样+L-BFGS-B优化
+            def min_obj(X):
+                # 最小化 (-EI) 等同于 最大化 EI
+                return -self._expected_improvement(X.reshape(1, -1), X_sample, Y_sample, gp)
+            
+            # 随机生成候选点作为优化的起点
+            candidates = np.random.uniform(0, 1, size=(50, n_dims))
+            min_val = float('inf')
+            next_x = None
+            
+            # 从候选点中找几个最好的进行微调
+            ei_values = self._expected_improvement(candidates, X_sample, Y_sample, gp)
+            best_candidates_idx = np.argsort(ei_values)[-3:] # 取EI最大的3个
+            
+            for idx in best_candidates_idx:
+                res = minimize(min_obj, x0=candidates[idx], bounds=bounds, method='L-BFGS-B')
+                if res.fun < min_val:
+                    min_val = res.fun
+                    next_x = res.x
+            
+            if next_x is None: # 兜底
+                next_x = candidates[0]
+
+            # C. 评估真实目标函数
+            next_y = self.objective_function(next_x)
+            
+            # D. 更新数据
+            X_sample = np.vstack((X_sample, next_x))
+            Y_sample = np.append(Y_sample, next_y)
+            
+        # 返回最优结果
+        best_idx = np.argmin(Y_sample)
+        best_raw_weights = X_sample[best_idx]
+        best_mape = Y_sample[best_idx]
+        
+        return self._normalize_weights(best_raw_weights), best_mape
+
+    def predict(self, best_norm_weights):
+        # 复用预测逻辑，注意此时传入的 weights 已经是归一化后的
+        u_prior_mixed = np.sum(best_norm_weights * self.source_means)
+        b_ts_mixed = np.sum(best_norm_weights * self.source_bts)
+        
+        n_t = len(self.target_train)
+        _, u_t_star, _, _ = hypar_update(
+            n_t, self.target_train, 
+            self.a, self.b_s, b_ts_mixed, 
+            u_prior_mixed, self.v_t
+        )
+        return u_t_star
+
+# =====================================================
+# 3. 主程序
+# =====================================================
+if __name__ == "__main__":
+    # 目标域数据
+    target_data = {
+        "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
+        "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
+        "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
+    }
+
+    # 所有源域数据
+    source_datasets_raw = {
+        "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
+        "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
+        "L3": {"Compressive": [5276, 5326, 5354, 5250, 5300], "Failure": [4748, 4784, 4814, 4726, 4764], "Yield": [4038, 4062, 4100, 3994, 4028]},
+        "L4": {"Compressive": [7568, 7574, 7608, 7496, 7580], "Failure": [6816, 6816, 6842, 6744, 6820], "Yield": [5702, 5636, 5616, 5574, 5624]},
+        "L5": {"Compressive": [4788, 4726, 4814, 4816, 4750], "Failure": [4544, 4486, 4570, 4572, 4510], "Yield": [4520, 4478, 4532, 4554, 4500]},
+        
+        "M1": {"Compressive": [6496, 6580, 6536, 6486, 6484], "Failure": [6168, 6248, 6212, 6164, 6160], "Yield": [5532, 5574, 5540, 5520, 5580]},
+        "M2": {"Compressive": [7598, 7540, 7738, 7678, 7632], "Failure": [7220, 7162, 7350, 7306, 7248], "Yield": [6312, 6336, 6412, 6302, 6368]},
+        "M3": {"Compressive": [5608, 5736, 5722, 5630, 5482], "Failure": [5326, 5448, 5426, 5348, 5206], "Yield": [4896, 5010, 5014, 4910, 4886]},
+        "M4": {"Compressive": [6510, 6650, 6630, 6532, 6426], "Failure": [6184, 6318, 6296, 6204, 6102], "Yield": [5360, 5520, 5508, 5390, 5332]},
+        "M5": {"Compressive": [6528, 6554, 6568, 6616, 6570], "Failure": [6200, 6228, 6238, 6288, 6240], "Yield": [5604, 5628, 5572, 5652, 5646]},
+        
+        "H1": {"Compressive": [6500, 6594, 6526, 6456, 6526], "Failure": [6170, 6272, 6194, 6128, 6196], "Yield": [5378, 5442, 5436, 5322, 5368]},
+        "H2": {"Compressive": [6632, 6636, 6584, 6572, 6572], "Failure": [6300, 6302, 6254, 6240, 6236], "Yield": [5606, 5534, 5626, 5552, 5552]},
+        "H3": {"Compressive": [6568, 6558, 6516, 6564, 6410], "Failure": [6236, 6230, 6184, 6238, 6088], "Yield": [5358, 5350, 5244, 5372, 5266]},
+        "H4": {"Compressive": [6474, 6522, 6458, 6536, 6388], "Failure": [6146, 6194, 6140, 6206, 6066], "Yield": [5310, 5294, 5252, 5326, 5218]},
+        "H5": {"Compressive": [6112, 6258, 6298, 6292, 6386], "Failure": [5802, 5946, 5978, 5978, 6066], "Yield": [5016, 5122, 5116, 5066, 5208]}
+    }
+
+    rho_map = {}
+    for name in source_datasets_raw.keys():
+        if name.startswith("L"): rho_map[name] = 0.1
+        elif name.startswith("M"): rho_map[name] = 0.5
+        elif name.startswith("H"): rho_map[name] = 0.9
+
+    print(f"{'Property':<15} | {'True Value':<10} | {'Pred Value':<10} | {'Test MAPE':<10} | {'Optimization':<15}")
+    print("-" * 75)
+
+    total_mape = 0
+
+    for prop in ["Compressive", "Failure", "Yield"]:
+        prop_sources = {k: np.array(v[prop]) for k, v in source_datasets_raw.items()}
+        
+        # 使用 BO 优化器
+        optimizer = MultiSourceBayesianTransferBO(
+            target_train=target_data[prop]["train"],
+            source_datasets=prop_sources,
+            rho_map=rho_map
+        )
+        
+        # 运行 BO (迭代次数较少，例如25次，因为BO效率高)
+        best_norm_weights, min_loo_error = optimizer.optimize_weights_bo(n_iters=25, n_initial=5)
+        
+        final_pred = optimizer.predict(best_norm_weights)
+        true_val = target_data[prop]["test"]
+        test_error = mape(true_val, final_pred)
+        total_mape += test_error
+        
+        sorted_indices = np.argsort(best_norm_weights)[::-1]
+        top_sources = [f"{optimizer.source_names[i]}({best_norm_weights[i]:.2f})" for i in sorted_indices[:3]]
+        top_sources_str = ", ".join(top_sources)
+
+        print(f"{prop:<15} | {true_val:<10} | {final_pred:<10.2f} | {test_error:<9.2f}% | Top: {top_sources_str}")
+
+    print("-" * 75)
+    print(f"Average Test MAPE (Multi-Source BO Optimized): {total_mape / 3:.2f}%")
