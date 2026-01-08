@@ -4,7 +4,7 @@ from sklearn.gaussian_process.kernels import Matern, ConstantKernel as C
 from scipy.stats import norm
 from scipy.optimize import minimize
 import warnings
-
+def hypar_update(n, D, a, b, b_ts, u, v):
 warnings.filterwarnings("ignore")
 
     if n == 0: 
