@@ -1,0 +1,219 @@
+import numpy as np
+from scipy.stats import norm
+
+# =====================================================
+# 1. 核心数学模型 (Property 2 from paper)
+# =====================================================
+def hypar_update(n, D, a, b, b_ts, u, v):
+    """
+    根据论文公式更新超参数
+    """
+    if n == 0: 
+        return v, u, a, b
+
+    x_bar = np.mean(D)
+    S = np.var(D, ddof=0) 
+
+    v_new = v + n
+    u_new = (v * u + n * x_bar) / (v + n)
+    a_new = a + n / 2
+    
+    denom_term = (b / b_ts) + (n * S / 2) + (n * v * (x_bar - u) ** 2 / (2 * (n + v)))
+    
+    if denom_term == 0:
+        b_new = b 
+    else:
+        b_new = 1.0 / denom_term
+
+    return v_new, u_new, a_new, b_new
+
+def mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+# =====================================================
+# 2. 多源域贝叶斯迁移类 (基于 EM 算法)
+# =====================================================
+class MultiSourceBayesianTransferEM:
+    def __init__(self, target_train, source_datasets, rho_map):
+        self.target_train = target_train
+        self.source_datasets = source_datasets
+        self.source_names = list(source_datasets.keys())
+        self.rho_map = rho_map
+        
+        # 预计算源域统计量
+        self.source_means = []
+        self.source_stds = [] # 用于计算似然
+        self.source_bts = []
+        
+        # 固定超参数
+        self.a = 10
+        self.b_t = 1
+        self.b_s = 1
+        self.v_t = 10
+        
+        for name in self.source_names:
+            D_s = self.source_datasets[name]
+            rho = self.rho_map.get(name, 0.9)
+            
+            # 计算源域均值
+            u_s = np.mean(D_s)
+            self.source_means.append(u_s)
+            
+            # 计算源域标准差 (用于 EM 中的似然计算)
+            # 这里我们假设源域的标准差可以反映其分布的“宽度”
+            std_s = np.std(D_s, ddof=1)
+            if std_s == 0: std_s = 1e-6 # 防止除零
+            self.source_stds.append(std_s)
+            
+            # 计算 b_ts
+            b_ts = (1 - rho) * self.b_t * self.b_s
+            self.source_bts.append(b_ts)
+            
+        self.source_means = np.array(self.source_means)
+        self.source_stds = np.array(self.source_stds)
+        self.source_bts = np.array(self.source_bts)
+
+    def optimize_weights_em(self, max_iter=100, tol=1e-5):
+        """
+        使用 EM 算法优化权重
+        """
+        n_sources = len(self.source_names)
+        n_samples = len(self.target_train)
+        
+        # 初始化权重 (均匀分布)
+        weights = np.ones(n_sources) / n_sources
+        
+        # 记录 Log-Likelihood 以判断收敛
+        log_likelihood_history = []
+        
+        for iteration in range(max_iter):
+            # ------------------------------------------------
+            # E-step (Expectation): 计算责任度 (Responsibilities)
+            # gamma[i, k] 表示第 k 个源域对第 i 个目标样本的解释程度
+            # ------------------------------------------------
+            gamma = np.zeros((n_samples, n_sources))
+            
+            for i in range(n_samples):
+                x = self.target_train[i]
+                for k in range(n_sources):
+                    # 计算似然 P(x | source_k)
+                    # 这里假设源域 k 定义了一个高斯分布 N(u_s, sigma_s)
+                    # 我们计算目标样本 x 落在该分布中的概率密度
+                    likelihood = norm.pdf(x, loc=self.source_means[k], scale=self.source_stds[k])
+                    
+                    # 分子: w_k * P(x | k)
+                    gamma[i, k] = weights[k] * likelihood
+            
+            # 归一化 gamma (使得对每个样本，所有源域的责任度之和为 1)
+            row_sums = gamma.sum(axis=1, keepdims=True)
+            # 防止除以零
+            row_sums[row_sums == 0] = 1e-10
+            gamma = gamma / row_sums
+            
+            # ------------------------------------------------
+            # M-step (Maximization): 更新权重
+            # 新权重是所有样本上责任度的平均值
+            # ------------------------------------------------
+            new_weights = gamma.mean(axis=0)
+            
+            # 确保权重非负且和为1 (数值稳定性)
+            new_weights = np.maximum(new_weights, 0)
+            new_weights /= (new_weights.sum() + 1e-10)
+            
+            # ------------------------------------------------
+            # 收敛检测
+            # ------------------------------------------------
+            diff = np.abs(new_weights - weights).sum()
+            weights = new_weights
+            
+            if diff < tol:
+                break
+                
+        return weights, iteration
+
+    def predict(self, weights):
+        """
+        使用优化后的权重进行最终预测
+        """
+        # 1. 混合源域先验
+        u_prior_mixed = np.sum(weights * self.source_means)
+        b_ts_mixed = np.sum(weights * self.source_bts)
+        
+        # 2. 贝叶斯更新
+        n_t = len(self.target_train)
+        _, u_t_star, _, _ = hypar_update(
+            n_t, self.target_train, 
+            self.a, self.b_s, b_ts_mixed, 
+            u_prior_mixed, self.v_t
+        )
+        return u_t_star
+
+# =====================================================
+# 3. 主程序
+# =====================================================
+if __name__ == "__main__":
+    # 目标域数据
+    target_data = {
+        "Compressive": {"train": np.array([6100, 6302, 6210]), "test": 6288},
+        "Failure":     {"train": np.array([5796, 5988, 5898]), "test": 5970},
+        "Yield":       {"train": np.array([4864, 5010, 4992]), "test": 4968}
+    }
+
+    # 所有源域数据
+    source_datasets_raw = {
+        "L1": {"Compressive": [5176, 4982, 5008, 5082, 5044], "Failure": [4654, 4480, 4500, 4564, 4532], "Yield": [4369, 4232, 4138, 4320, 4174]},
+        "L2": {"Compressive": [7318, 7446, 7572, 7412, 7280], "Failure": [6592, 6696, 6812, 6668, 6550], "Yield": [5648, 5666, 5724, 5572, 5618]},
+        "L3": {"Compressive": [5276, 5326, 5354, 5250, 5300], "Failure": [4748, 4784, 4814, 4726, 4764], "Yield": [4038, 4062, 4100, 3994, 4028]},
+        "L4": {"Compressive": [7568, 7574, 7608, 7496, 7580], "Failure": [6816, 6816, 6842, 6744, 6820], "Yield": [5702, 5636, 5616, 5574, 5624]},
+        "L5": {"Compressive": [4788, 4726, 4814, 4816, 4750], "Failure": [4544, 4486, 4570, 4572, 4510], "Yield": [4520, 4478, 4532, 4554, 4500]},
+        
+        "M1": {"Compressive": [6496, 6580, 6536, 6486, 6484], "Failure": [6168, 6248, 6212, 6164, 6160], "Yield": [5532, 5574, 5540, 5520, 5580]},
+        "M2": {"Compressive": [7598, 7540, 7738, 7678, 7632], "Failure": [7220, 7162, 7350, 7306, 7248], "Yield": [6312, 6336, 6412, 6302, 6368]},
+        "M3": {"Compressive": [5608, 5736, 5722, 5630, 5482], "Failure": [5326, 5448, 5426, 5348, 5206], "Yield": [4896, 5010, 5014, 4910, 4886]},
+        "M4": {"Compressive": [6510, 6650, 6630, 6532, 6426], "Failure": [6184, 6318, 6296, 6204, 6102], "Yield": [5360, 5520, 5508, 5390, 5332]},
+        "M5": {"Compressive": [6528, 6554, 6568, 6616, 6570], "Failure": [6200, 6228, 6238, 6288, 6240], "Yield": [5604, 5628, 5572, 5652, 5646]},
+        
+        "H1": {"Compressive": [6500, 6594, 6526, 6456, 6526], "Failure": [6170, 6272, 6194, 6128, 6196], "Yield": [5378, 5442, 5436, 5322, 5368]},
+        "H2": {"Compressive": [6632, 6636, 6584, 6572, 6572], "Failure": [6300, 6302, 6254, 6240, 6236], "Yield": [5606, 5534, 5626, 5552, 5552]},
+        "H3": {"Compressive": [6568, 6558, 6516, 6564, 6410], "Failure": [6236, 6230, 6184, 6238, 6088], "Yield": [5358, 5350, 5244, 5372, 5266]},
+        "H4": {"Compressive": [6474, 6522, 6458, 6536, 6388], "Failure": [6146, 6194, 6140, 6206, 6066], "Yield": [5310, 5294, 5252, 5326, 5218]},
+        "H5": {"Compressive": [6112, 6258, 6298, 6292, 6386], "Failure": [5802, 5946, 5978, 5978, 6066], "Yield": [5016, 5122, 5116, 5066, 5208]}
+    }
+
+    rho_map = {}
+    for name in source_datasets_raw.keys():
+        if name.startswith("L"): rho_map[name] = 0.1
+        elif name.startswith("M"): rho_map[name] = 0.5
+        elif name.startswith("H"): rho_map[name] = 0.9
+
+    print(f"{'Property':<15} | {'True Value':<10} | {'Pred Value':<10} | {'Test MAPE':<10} | {'Optimization':<15}")
+    print("-" * 75)
+
+    total_mape = 0
+
+    for prop in ["Compressive", "Failure", "Yield"]:
+        prop_sources = {k: np.array(v[prop]) for k, v in source_datasets_raw.items()}
+        
+        optimizer = MultiSourceBayesianTransferEM(
+            target_train=target_data[prop]["train"],
+            source_datasets=prop_sources,
+            rho_map=rho_map
+        )
+        
+        # 运行 EM 算法
+        weights, iterations = optimizer.optimize_weights_em()
+        
+        final_pred = optimizer.predict(weights)
+        true_val = target_data[prop]["test"]
+        test_error = mape(true_val, final_pred)
+        total_mape += test_error
+        
+        # 排序并显示权重最高的源域
+        sorted_indices = np.argsort(weights)[::-1]
+        top_sources = [f"{optimizer.source_names[i]}({weights[i]:.2f})" for i in sorted_indices[:3]]
+        top_sources_str = ", ".join(top_sources)
+
+        print(f"{prop:<15} | {true_val:<10} | {final_pred:<10.2f} | {test_error:<9.2f}% | Top: {top_sources_str}")
+
+    print("-" * 75)
+    print(f"Average Test MAPE (Multi-Source EM Optimized): {total_mape / 3:.2f}%")
