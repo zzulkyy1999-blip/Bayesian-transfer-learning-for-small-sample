@@ -1,0 +1,189 @@
+import numpy as np
+from scipy.stats import norm
+import mpmath as mh
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+from mpl_toolkits.mplot3d import Axes3D  # noqa
+
+mh.mp.dps = 10
+mh.mp.pretty = True
+np.random.seed(1)  
+
+a, b_t, b_s = 10, 1, 1
+u_t, v_t, u_s, v_s = 0, 10, 0, 10
+mu_t, gamma_t, n_t = 0.0, 10.0, 10
+gamma_s_fixed = 10.0
+sigma2_true = 1.0 / gamma_t
+
+def hypar_update(n, D, a, b, b_ts, u, v):
+    v_new = v + n
+    a_new = a + n / 2
+    x_bar = np.mean(D)
+    u_new = (v * u + n * x_bar) / (v + n)
+    S = np.var(D)
+    b_new = 1 / (b / b_ts + n * S / 2 + n * v * (x_bar - u)**2 / (2 * (n + v)))
+    return v_new, u_new, a_new, b_new
+
+def post_pred_var(a, c, a_t_new, b_t_new, v_t_new, a_s_new, b_s_new):
+    z = c * b_t_new * b_s_new
+    try:
+        num = mh.hyp2f1(a_t_new - 1, a_s_new, a, z, asymp_tol=1e-4)
+        den = mh.hyp2f1(a_t_new,     a_s_new, a, z, asymp_tol=1e-4)
+        ratio = num / den
+    except Exception:
+        ratio = 1.0  
+    var = (1 + v_t_new) / (v_t_new * b_t_new * (a_t_new - 1)) * ratio
+    return float(mh.re(var))
+
+def ga_optimize_weights(a_t_new, b_t_new, v_t_new,
+                        a_s_all, b_s_all, c_all,
+                        pop_size=30, n_gen=30, mutation_rate=0.2, elite_ratio=0.2):
+    K = len(a_s_all)
+
+    def random_weights():
+        x = np.random.rand(K)
+        return x / np.sum(x)
+
+    def eval_fitness(w):
+        a_s_eff = np.sum(w * a_s_all)
+        b_s_eff = np.sum(w * b_s_all)
+        c_eff   = np.sum(w * c_all)
+        sigma2_hat = post_pred_var(a, c_eff, a_t_new, b_t_new, v_t_new, a_s_eff, b_s_eff)
+        return (sigma2_hat - sigma2_true)**2
+
+    population = [random_weights() for _ in range(pop_size)]
+    n_elite = max(1, int(pop_size * elite_ratio))
+
+    for _ in range(n_gen):
+        fitness = np.array([eval_fitness(w) for w in population])
+        idx = np.argsort(fitness)
+        elites = [population[i] for i in idx[:n_elite]]
+
+        new_pop = elites.copy()
+        while len(new_pop) < pop_size:
+            p1, p2 = population[np.random.randint(pop_size)], population[np.random.randint(pop_size)]
+            alpha = np.random.rand()
+            child = alpha * p1 + (1 - alpha) * p2
+            if np.random.rand() < mutation_rate:
+                noise = np.random.normal(0, 0.1, size=K)
+                child = np.clip(child + noise, 1e-8, None)
+            child /= np.sum(child)
+            new_pop.append(child)
+        population = new_pop
+
+    fitness = np.array([eval_fitness(w) for w in population])
+    best_w = population[np.argmin(fitness)]
+    a_s_eff = np.sum(best_w * a_s_all)
+    b_s_eff = np.sum(best_w * b_s_all)
+    c_eff   = np.sum(best_w * c_all)
+    sigma2_hat_best = post_pred_var(a, c_eff, a_t_new, b_t_new, v_t_new, a_s_eff, b_s_eff)
+    return sigma2_hat_best
+
+def simulate_one_rep_fixed(K, n_s_level, rho_level, gamma_s=gamma_s_fixed):
+   
+    n_s_vec = np.full(K, n_s_level)
+    rho_vec = np.full(K, rho_level)
+
+    D_t = norm.rvs(loc=mu_t, scale=1 / np.sqrt(gamma_t), size=n_t)
+    rho_eff = rho_level
+    b_ts_t = (1 - rho_eff) * b_t * b_s
+    v_t_new, u_t_new, a_t_new, b_t_new = hypar_update(n_t, D_t, a, b_s, b_ts_t, u_t, v_t)
+
+    a_s_all, b_s_all, c_all = [], [], []
+    for k in range(K):
+        n_s_k = n_s_vec[k]
+        rho_k = rho_vec[k]
+        b_ts_k = (1 - rho_k) * b_t * b_s
+        c_k = (b_t * b_s - b_ts_k) / (b_ts_k**2)
+
+        D_s_k = norm.rvs(loc=0.0, scale=1 / np.sqrt(gamma_s), size=n_s_k)
+        v_s_new, u_s_new, a_s_new, b_s_new = hypar_update(
+            n_s_k, D_s_k, a, b_t, b_ts_k, u_s, v_s
+        )
+        a_s_all.append(a_s_new)
+        b_s_all.append(b_s_new)
+        c_all.append(c_k)
+
+    a_s_all = np.array(a_s_all)
+    b_s_all = np.array(b_s_all)
+    c_all   = np.array(c_all)
+
+    sigma_tgt = np.var(D_t, ddof=1)
+    sigma_GA = ga_optimize_weights(a_t_new, b_t_new, v_t_new, a_s_all, b_s_all, c_all)
+    return sigma_tgt, sigma_GA
+
+def simulate_condition(K, n_s_level, rho_level, n_rep=50):
+    err_t_list = []
+    err_GA_list = []
+    for _ in range(n_rep):
+        sigma_tgt, sigma_GA = simulate_one_rep_fixed(K, n_s_level, rho_level)
+        err_t_list.append((sigma_tgt - sigma2_true)**2)
+        err_GA_list.append((sigma_GA  - sigma2_true)**2)
+    return np.mean(err_t_list), np.mean(err_GA_list)
+
+def run_grid_simulation():
+    K_list = [5, 10, 15, 20]
+    n_s_levels = [100, 400, 800]         
+    rho_levels = [0.1, 0.5, 0.9]          
+    n_rep = 50                       
+
+    records = []
+    for K in K_list:
+        for n_s_level in n_s_levels:
+            for rho_level in rho_levels:
+                mse_t, mse_GA = simulate_condition(K, n_s_level, rho_level, n_rep=n_rep)
+                records.append({
+                    "K": K,
+                    "n_s": n_s_level,
+                    "rho": rho_level,
+                    "MSE_target": mse_t * 1e4, 
+                    "MSE_GA":     mse_GA * 1e4
+                })
+                print(f"K={K}, n_s={n_s_level}, rho={rho_level:.1f} -> "
+                      f"MSE_target={mse_t*1e4:.3f}, MSE_GA={mse_GA*1e4:.3f}")
+
+    df = pd.DataFrame(records)
+    print("\n===== result（GA MSE ×10^-4）=====")
+    print(df.pivot_table(index=["K","rho"], columns="n_s", values="MSE_GA").round(3))
+    return df, n_s_levels, rho_levels, K_list
+
+def plot_surfaces_smooth(df, n_s_levels, rho_levels, K_list):
+    for K in K_list:
+        sub = df[df["K"] == K]
+
+        X_coarse, Y_coarse = np.meshgrid(n_s_levels, rho_levels)
+        Z_coarse = sub.pivot(index="rho", columns="n_s", values="MSE_GA").values
+
+        points = np.column_stack([X_coarse.ravel(), Y_coarse.ravel()])
+        values = Z_coarse.ravel()
+
+        nx, ny = 60, 60
+        x_fine = np.linspace(min(n_s_levels), max(n_s_levels), nx)
+        y_fine = np.linspace(min(rho_levels), max(rho_levels), ny)
+        X_fine, Y_fine = np.meshgrid(x_fine, y_fine)
+        Z_fine = griddata(points, values, (X_fine, Y_fine), method="cubic")
+
+        mask_nan = np.isnan(Z_fine)
+        if np.any(mask_nan):
+            Z_fine_nn = griddata(points, values, (X_fine, Y_fine), method="nearest")
+            Z_fine[mask_nan] = Z_fine_nn[mask_nan]
+
+        fig = plt.figure(figsize=(7, 5))
+        ax = fig.add_subplot(111, projection="3d")
+        surf = ax.plot_surface(X_fine, Y_fine, Z_fine,
+                               cmap="viridis",
+                               linewidth=0,
+                               antialiased=True,
+                               alpha=0.95)
+        ax.set_xlabel(r"$n_s$")
+        ax.set_ylabel(r"$\rho$")
+        ax.set_zlabel(r"GA MSE ($\times 10^{-4}$)")
+        ax.set_title(f"GA-opt MSE surface (K = {K})")
+        fig.colorbar(surf, shrink=0.7, pad=0.1, label=r"MSE ($\times 10^{-4}$)")
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    df_grid, n_s_levels, rho_levels, K_list = run_grid_simulation()
+    plot_surfaces_smooth(df_grid, n_s_levels, rho_levels, K_list)
