@@ -1,0 +1,92 @@
+import numpy as np
+from scipy.stats import norm
+import mpmath as mh
+import pandas as pd
+
+mh.mp.dps = 10
+mh.mp.pretty = True
+np.random.seed(0)  
+# bivariate gamma 
+a = 10
+b_t = 1
+b_s = 1
+
+u_t = 0
+v_t = 10
+u_s = 0
+v_s = 10
+
+mu_t = 0.0
+gamma_t = 10.0      
+n_t = 10           
+
+def hypar_update(n, D, a, b, b_ts, u, v):
+    v_new = v + n
+    a_new = a + n / 2
+    x_bar = np.mean(D)
+    u_new = (v * u + n * x_bar) / (v + n)
+    S = np.var(D)
+    b_new = 1 / (b / b_ts + n * S / 2 + n * v * (x_bar - u) ** 2 / (2 * (n + v)))
+    return v_new, u_new, a_new, b_new
+
+def post_pred_var(a, c, a_t_new, b_t_new, v_t_new, a_s_new, b_s_new):
+    """
+    Var(x_t | D_t, D_s)
+      = (1 + v_t*) / [v_t* b_t* (a_t* - 1)]
+        × 2F1(a_t* - 1, a_s*; a; c b_t* b_s*) / 2F1(a_t*, a_s*; a; c b_t* b_s*)
+    """
+    z = c * b_t_new * b_s_new
+    num = mh.hyp2f1(a_t_new - 1, a_s_new, a, z, asymp_tol=1e-4)
+    den = mh.hyp2f1(a_t_new,     a_s_new, a, z, asymp_tol=1e-4)
+    var = (1.0 + v_t_new) / (v_t_new * b_t_new * (a_t_new - 1)) * (num / den)
+    return float(var)
+
+def simulate_var_mse_for_rho(rho, n_s, gamma_s, n_rep=200):
+
+    b_ts = (1 - rho) * b_t * b_s
+    c = (b_t * b_s - b_ts) / (b_ts ** 2)
+
+    sigma2_true = 1.0 / gamma_t
+    sq_err_list = []
+
+    for _ in range(n_rep):
+        D_t = norm.rvs(loc=mu_t, scale=1 / np.sqrt(gamma_t), size=n_t)
+        D_s = norm.rvs(loc=0.0,   scale=1 / np.sqrt(gamma_s), size=n_s)
+
+        v_t_new, u_t_new, a_t_new, b_t_new = hypar_update(n_t, D_t, a, b_s, b_ts, u_t, v_t)
+        v_s_new, u_s_new, a_s_new, b_s_new = hypar_update(n_s, D_s, a, b_t, b_ts, u_s, v_s)
+
+        sigma2_hat = post_pred_var(a, c, a_t_new, b_t_new, v_t_new, a_s_new, b_s_new)
+
+        sq_err_list.append((sigma2_hat - sigma2_true) ** 2)
+
+    return np.mean(sq_err_list)
+
+rhos = [0.0, 0.3, 0.6, 0.7, 0.8, 0.9]
+n_s_list = [50, 100, 200, 500, 1000]
+gamma_s_list = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0]
+
+results = []
+
+for n_s in n_s_list:
+    for gamma_s in gamma_s_list:
+        for rho in rhos:
+            mse_rho = simulate_var_mse_for_rho(rho, n_s, gamma_s, n_rep=200)
+            results.append({
+                "n_s": n_s,
+                "gamma_s": gamma_s,
+                "rho": rho,
+                "MSE_x1e4": mse_rho * 1e4  
+            })
+
+df = pd.DataFrame(results)
+
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+
+print("===== all (n_s, gamma_s, rho)  MSE（×1e-4）=====")
+print(df.to_string(index=False))
+
+pivot = df.pivot(index=["n_s", "gamma_s"], columns="rho", values="MSE_x1e4")
+print("\n===== table：Row=(n_s, gamma_s)，Column=rho，value=MSE（×1e-4）=====")
+print(pivot.to_string())
