@@ -21,7 +21,7 @@ for filename in files:
         try:
             df = pd.read_csv(filepath, skiprows=1, sep=r'\s+', encoding='gbk')
 
-            plt.plot(df['time'], df['Test force'], label=filename.replace('.txt', ''))
+            plt.plot(df['时间'], df['试验力'], label=filename.replace('.txt', ''))
             print(f"draw: {filename}")
 
         except Exception as e:
