@@ -1,0 +1,41 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+files = ['H1-1.txt', 'H1-2.txt', 'H1-3.txt', 'H1-4.txt', 'H1-5.txt','H2-1.txt', 'H2-2.txt', 'H2-3.txt', 'H2-4.txt', 'H2-5.txt',
+         'H3-1.txt', 'H3-2.txt', 'H3-3.txt', 'H3-4.txt', 'H3-5.txt','H4-1.txt', 'H4-2.txt', 'H4-3.txt', 'H4-4.txt', 'H4-5.txt',
+         'H5-1.txt', 'H5-2.txt', 'H5-3.txt', 'H5-4.txt', 'H5-5.txt']
+
+plt.figure(figsize=(10, 6))  
+
+for filename in files:
+   
+    filepath = os.path.join(current_dir, filename)
+
+    if os.path.exists(filepath):
+        try:
+            df = pd.read_csv(filepath, skiprows=1, sep=r'\s+', encoding='gbk')
+
+            plt.plot(df['time'], df['Test force'], label=filename.replace('.txt', ''))
+            print(f"draw: {filename}")
+
+        except Exception as e:
+            print(f"read {filename} false: {e}")
+    else:
+        print(f"cant find the file: {filename} (please entertain {current_dir} )")
+
+plt.title('Test force versus time relationship for highly relevant source domains')
+plt.xlabel('Time(s)')
+plt.ylabel('Test force')
+plt.legend() 
+plt.grid(True) 
+
+save_path = os.path.join(current_dir, 'result.png')
+plt.savefig(save_path)
+print(f"save pic: {save_path}")
+plt.show()
