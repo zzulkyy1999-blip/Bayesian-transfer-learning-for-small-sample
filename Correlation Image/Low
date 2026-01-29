@@ -1,0 +1,33 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+files = ['L1-1.txt', 'L1-2.txt', 'L1-3.txt', 'L1-4.txt', 'L1-5.txt','L2-1.txt', 'L2-2.txt', 'L2-3.txt', 'L2-4.txt', 'L2-5.txt',
+'L3-1.txt', 'L3-2.txt', 'L3-3.txt', 'L3-4.txt', 'L3-5.txt','L4-1.txt', 'L4-2.txt', 'L4-3.txt', 'L4-4.txt', 'L4-5.txt',
+'L5-1.txt', 'L5-2.txt', 'L5-3.txt', 'L5-4.txt', 'L5-5.txt']
+plt.figure(figsize=(10, 6))  
+for filename in files:
+    filepath = os.path.join(current_dir, filename)
+
+    if os.path.exists(filepath):
+        try:
+            df = pd.read_csv(filepath, skiprows=1, sep=r'\s+', encoding='gbk')
+            plt.plot(df['time'], df['Test force'], label=filename.replace('.txt', ''))
+            print(f"draw: {filename}")
+
+        except Exception as e:
+            print(f"read {filename} false: {e}")
+    else:
+        print(f"cant find file: {filename} (entertain file {current_dir} 下)")
+
+plt.title('Test force versus time relationship for low relevant source domains')
+plt.xlabel('Time(s)')
+plt.ylabel('Test force')
+plt.legend() 
+plt.grid(True) 
+plt.show()
